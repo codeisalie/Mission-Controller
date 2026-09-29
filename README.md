@@ -1,5 +1,5 @@
 <p align="center">
-<img width="1024" height="1024" alt="Icon-iOS-Default-1024@1x" src="https://github.com/user-attachments/assets/3bb2120b-5841-448d-adff-bd1f90bd6516" />
+<img width="362" height="266" alt="Screenshot 2026-09-29 at 12 40 39 PM" src="https://github.com/user-attachments/assets/9a31e31e-e256-4d9b-b4b6-c4f1fda87086" />
 </p>
 
 # Mission Controller 🚀
