@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="path_to_your_icon_or_logo.png" width="120" alt="Mission Controller Logo">
+<img width="1024" height="1024" alt="Icon-iOS-Default-1024@1x" src="https://github.com/user-attachments/assets/3bb2120b-5841-448d-adff-bd1f90bd6516" />
 </p>
 
 # Mission Controller 🚀
