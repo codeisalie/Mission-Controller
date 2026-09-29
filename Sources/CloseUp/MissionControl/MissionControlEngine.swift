@@ -1,0 +1,1373 @@
+import AppKit
+import CloseUpKit
+import SwiftUI
+
+/// Orchestrates the Mission Control overlay: observes MC open/close, tracks the
+/// hovered thumbnail, positions a passive overlay window over it, and routes
+/// clicks (via the event tap + `OverlayGeometry`) and in-MC shortcuts to the
+/// window-action performer. All decision logic lives in tested `CloseUpKit` pure
+/// functions; this type is the thin platform-glue that wires them to live
+/// observers, timers, and an `NSWindow`.
+@MainActor
+final class MissionControlEngine {
+    /// Provides the enabled overlay actions (left-to-right) — read live so a
+    /// settings change takes effect on the next session.
+    private let actionsProvider: () -> [WindowAction]
+    /// Resolves the key chord for an in-MC shortcut (defaults, or a
+    /// KeyboardShortcuts-backed provider once that lands).
+    private let chordProvider: (MissionControlShortcut) -> KeyChord?
+    /// The locale the overlay renders in (the in-app language override).
+    private let localeProvider: () -> Locale
+    /// CloseUp's own process id, so its windows can be treated specially (its
+    /// Settings window is actionable too).
+    private let ownPID: pid_t = ProcessInfo.processInfo.processIdentifier
+
+    private let enumerator: any WindowEnumerating
+    private let performer: any WindowActionPerforming
+    /// Resolves, per window, which title-bar controls actually exist (via AX) so
+    /// the overlay only lights up real, closable/minimizable/zoomable windows —
+    /// not popovers/sheets/panels. `nil` from it means Accessibility is unavailable
+    /// and we fall back to showing every enabled action.
+    private let capabilityResolver: any WindowCapabilityResolving
+    private let observer = MissionControlObserver()
+    private let tap = EventTap()
+
+    /// The overlay window currently ON SCREEN (nil while the lights are hidden).
+    /// A shown window is immutable — it is born at its final frame and never
+    /// moved or re-filled: every show retires it and orders in a fresh one (see
+    /// `presentOverlay`), so it can never pick up the system's implicit
+    /// window-move animation during Mission Control (#6).
+    private var overlayWindow: NSWindow?
+    private var windows: [WindowInfo] = []
+    private var hovered: WindowInfo?
+    /// Cursor location at the last overlay resolve, used only as a SECONDARY guard to
+    /// skip a redundant re-resolve when the cursor has not moved between 60 Hz ticks
+    /// AND a window is already resolved/shown (`hovered != nil`) — when nothing is shown
+    /// yet, a stationary cursor must keep re-resolving so a first resolve that transiently
+    /// found no window still lights up once the thumbnail frame is reported on-screen
+    /// (a deliberate cursor-didn't-move early-out — re-resolving every tick when the
+    /// pointer is parked is wasted work). It is deliberately
+    /// NOT seeded at `beginSession`: it is `nil` while the engine is idle (reset in
+    /// `endSession`) and reset to `nil` again the instant the layout settles, so the
+    /// FIRST post-settle resolve always fires and shows the lights even when the cursor
+    /// is stationary — the fix for the "lights occasionally don't appear on a normal
+    /// enter" bug (a Mission Control swipe never moves the cursor, so a seed here blocked
+    /// that first show). Suppressing the still-entering / paused-mid-swipe case is the
+    /// job of the exact frame-stability settle gate (`layoutSettled`), not this cursor
+    /// guard — the enter/pause suppression is keyed off an exact whole-window-set
+    /// commit signal, never cursor movement.
+    private var lastMouseLocation: CGPoint?
+    private var geometry: OverlayGeometry?
+    /// The actions actually shown for the hovered window — the settings-enabled
+    /// set intersected with the window's real AX capabilities. Drives both the
+    /// rendered cluster and the click → action mapping (so button index N always
+    /// matches what is on screen).
+    private var currentActions: [WindowAction] = []
+    /// Per-window capabilities from this session's SUCCESSFUL non-empty AX
+    /// resolves — the hover path's FAST PATH: a cached window never pays AX IPC
+    /// again (the resolve used to run on every hover change, ~25–45 ms on the
+    /// first touch of each app, unbounded on a busy one — the "lights appear
+    /// late on another app" complaint). Filled by the session prewarm
+    /// (`requestBackgroundResolve`) usually before the first hover, and by the
+    /// sync resolve on a miss. Only authoritative non-empty resolutions are
+    /// stored (`OverlayCapabilityPolicy`): a `.none` might be an app still
+    /// warming up and `.indeterminate` is unknown — caching either could pin a
+    /// real window dark for the whole session, while a genuinely buttonless
+    /// popover just re-resolves cheap and stays dark. Cache-first also means a
+    /// transient failure can never blank a window that already showed real
+    /// controls. Cleared at every session boundary.
+    private var capabilityCache: [CGWindowID: WindowCapabilities] = [:]
+    /// Window ids currently being resolved off the main actor (session prewarm
+    /// / blank-hover retries), so overlapping requests never duplicate AX
+    /// traffic. Entries clear when their batch merges; tasks always merge.
+    private var backgroundResolveInFlight: Set<CGWindowID> = []
+    /// How many background resolves came back blank (authoritative `.none` or
+    /// `.indeterminate`) per window this session. Bounded by
+    /// `maxBackgroundResolveRounds` so a genuine popover stops being re-queried
+    /// after a few rounds, while a transiently-failing window still gets the
+    /// retries that heal the "stuck dark until you hover away and back" bug.
+    private var backgroundResolveRounds: [CGWindowID: Int] = [:]
+
+    /// Background retry budget per window per session. Three rounds spaced by
+    /// the ~100 ms fetch cadence cover the transient-failure window without
+    /// hammering a genuine popover (each extra round is a few warm AX reads).
+    private static let maxBackgroundResolveRounds = 3
+    /// Monotonic session counter stamped onto every background-resolve batch, so
+    /// a batch started in a PREVIOUS session can never merge into the current
+    /// one — its resolutions are stale (e.g. a window that went full-screen
+    /// between sessions would relight from the pre-transition read). Bumped at
+    /// every `beginSession`.
+    private var sessionGeneration = 0
+
+    /// Prevent stale Mission Control notifications from rebuilding the overlay while
+    /// a maximize action is closing Mission Control and restoring the desktop.
+    private var suppressSessionRestartUntil: ContinuousClock.Instant?
+    /// Set by `hideOverlay` (a click hid the lights) and cleared when the hover
+    /// moves to a DIFFERENT window: while set, the passive re-show paths — a
+    /// background-resolve merge, the suppression-clear timer — must NOT
+    /// re-light the window the user just clicked. Without it, a prewarm batch
+    /// still in flight at click time merges moments after a traffic-light hit
+    /// and re-shows the lights on the just-acted window, the documented
+    /// "post-click flash" class ("a button hit re-shows only on the next fresh
+    /// hover"). A fresh hover (windowID change in `trackMouse`) is the one
+    /// legitimate re-entry, and clearing there restores it.
+    private var awaitFreshHoverAfterClick = false
+    private let hoverState = OverlayHoverState()
+    private var pivotHeight: CGFloat = 0
+
+    private var mouseTask: Task<Void, Never>?
+    private var fetchTask: Task<Void, Never>?
+    /// Drives the whole session lifecycle off the reliable Dock-layer-18 signal
+    /// (the AX expose notifications are unreliable under trackpad swipes). Lives
+    /// for the engine's lifetime so it can *re-open* after a swipe's transient
+    /// exposé-surface teardown, not just close.
+    private var lifecycleTask: Task<Void, Never>?
+
+    /// Observes `NSWorkspace.activeSpaceDidChangeNotification` for the whole
+    /// lifetime of a running engine (not just while a session is live). A Space
+    /// change does two jobs here:
+    ///   1. re-syncs a live overlay to the now-active space's on-screen windows
+    ///      (the Dock re-tiles thumbnails to match the new grid), and
+    ///   2. **re-arms the Dock `AXObserver`** — the load-bearing fix for the
+    ///      field bug where switching into a full-screen app's Space left the
+    ///      observer permanently deaf, killing the overlay on *every* desktop
+    ///      until relaunch. Re-arming must therefore survive past `endSession`.
+    /// It does not, and cannot, cover merely *previewing* a non-active desktop's
+    /// strip thumbnail (no public/private API exposes Mission Control's thumbnail
+    /// layout) — a known limit shared with OpenMissionControl.
+    private var spaceObserver: NSObjectProtocol?
+
+    /// Low-frequency health poll that re-arms the observer if the Dock pid has
+    /// changed under it. The Dock is an agent, so `NSWorkspace` posts no
+    /// launch/terminate notification for it (verified — `didLaunchApplication`
+    /// never fires for `com.apple.dock`); polling the pid is the only reliable
+    /// way to catch a Dock crash/restart that would otherwise strand the
+    /// `AXObserver` on a dead pid forever.
+    private var healthTask: Task<Void, Never>?
+
+    /// Whether an overlay session is live. The authority on this is the
+    /// `lifecyclePoll` (the Dock's exposé layer-18 signal), NOT the AX expose
+    /// notifications — those fire spuriously under trackpad swipes. The poll
+    /// begins a session the moment MC is shown and ends it once MC is really gone,
+    /// so a swipe that momentarily drops the exposé surface self-heals on the next
+    /// tick instead of leaving the lights dead.
+    private var sessionActive = false
+
+    /// Whether the lifecycle poll observed the Dock's layer-18 exposé surface at
+    /// least once during the current session. A session that lives and dies
+    /// WITHOUT this ever going true was opened by the AX expose notification but
+    /// never confirmed by the poll — on a healthy macOS that ~never happens, so
+    /// its teardown fires the one-shot field tripwire (`logExposeSurfaceNeverSeen`)
+    /// that dumps where every non-standard-layer window lives, at `.notice` so a
+    /// post-hoc `log show` retrieves it (the `.debug` hot path is not persisted).
+    /// That single line is what lets a "no icons on macOS N+1" report be diagnosed
+    /// remotely if a release moves the surface off layer 18 / off the Dock. Set
+    /// only by the poll's live observation (never seeded like `mcSurfacePresent`);
+    /// reset in `endSession` — begin paths must not touch it, since the poll sets
+    /// it just before calling `beginSession` on a poll-detected open.
+    private var surfaceSeenThisSession = false
+
+    /// One-shot latch for the "capability prewarm all-dark" tripwire — see
+    /// `mergeBackgroundResolutions`. Reset at every `beginSession`.
+    private var loggedPrewarmAllDark = false
+
+    /// Consecutive churning refreshes (~100 ms each) while a session is live,
+    /// for the settle-starvation field tripwire: a macOS release that re-animates
+    /// Mission Control (continuous micro-motion / long eased tails) keeps
+    /// `didRetile` reading churn forever, `layoutSettled` never flips true, and
+    /// the lights never show anywhere while session/AX/permissions all look
+    /// healthy. When this passes `churnStarvationTicks` (~5 s — no real MC enter
+    /// or re-tile animates that long), one `.notice` line reports WHAT is moving
+    /// (`ThumbnailLayout.churnSample`) so a post-hoc `log show` both fingerprints
+    /// the failure mode and carries the data needed to retune the settle gate.
+    /// Reset whenever a refresh is not churning and in `resetSettleState`; the
+    /// one-shot latch re-arms per settle-cycle (`resetSettleState`) so distinct
+    /// starvation episodes in one long session each get a line.
+    private var churnTicks = 0
+    private var loggedChurnStarvation = false
+
+    /// Degraded-settle mode — the SELF-HEAL for the starved settle gate. While
+    /// false (every session's start), churn is judged by the strict exact
+    /// integer-pixel gate, which is the ratified design: any tolerance from the
+    /// start lets a paused interactive scrub read as "settled" and lights up
+    /// mid-gesture. When the strict gate has been starved for
+    /// `churnStarvationTicks` (~5 s — beyond any real enter/re-tile animation,
+    /// so only an OS that keeps thumbnails in perpetual micro-motion gets here,
+    /// as macOS 27's re-animated Mission Control does), churn judgment falls
+    /// back to `degradedSettleTolerancePx` so micro-jitter reads as settled and
+    /// the lights recover ~200 ms later through the NORMAL settle path (same
+    /// rebuild + sink-watch, one uniform rule). A real re-tile still reads as
+    /// churn in this mode — its per-tick deltas are tens of pixels. Cleared at
+    /// every `resetSettleState` (session begin / resync / end) so each session
+    /// starts strict.
+    private var degradedSettle = false
+
+    /// Whether the Dock's exposé surface (layer 18) was present at the last
+    /// lifecycle-poll tick. `sessionActive` lingers ~600 ms after Mission Control
+    /// actually closes (the close-miss debounce that lets a trackpad swipe's
+    /// transient teardown self-heal), and the event tap stays installed that whole
+    /// time — so an in-MC shortcut (⌘W/⌥⌘W/…) pressed in that tail would otherwise
+    /// be swallowed and acted on the now-stale hovered thumbnail. Gating the action
+    /// paths on this live signal keeps interception to *only while MC is open*
+    /// (CLAUDE.md), without shortening the session/overlay debounce.
+    private var mcSurfacePresent = false
+
+    /// Last-seen thumbnail frames (by window id), used to tell when Mission Control's
+    /// thumbnails are moving (frame churn) vs settled. Both the *enter* animation and
+    /// a later re-tile (Space switch, boundary swipe, full-screen transition) move the
+    /// thumbnails AND sink the overlay below the Dock's rebuilt exposé surface; the
+    /// overlay is hidden while they move and rebuilt once they settle — the one
+    /// recovery that also catches the no-Space-change boundary swipe (which fires
+    /// neither `activeSpaceDidChange` nor an exposé-surface change). See
+    /// `refreshWindows`.
+    private var windowFrames: [CGWindowID: CGRect] = [:]
+    /// Whether the thumbnail layout has settled enough to show the overlay. False at
+    /// the start of every session and whenever a re-tile begins, so the lights never
+    /// chase Mission Control's still-animating thumbnails — they appear only once the
+    /// layout holds still (so the lights show only after MC has finished entering). This EXACT frame-stability gate (see `didRetile`) is
+    /// now the SOLE authority on suppressing the still-entering / paused-mid-swipe case:
+    /// the cursor guard no longer seeds, so a paused interactive scrub stays dark only
+    /// because its thumbnails micro-jitter and never read as settled. Flipped by the
+    /// settle detector in `refreshWindows`; gates `trackMouse`.
+    private var layoutSettled = false
+    /// Consecutive non-churning refreshes since the last motion (or session begin).
+    /// The overlay is (re)shown once this reaches `settleTicks`, so the animation's
+    /// mid-flight micro-pauses coalesce into a single show instead of a flurry.
+    private var stableTicks = 0
+    /// Countdown (in `trackMouse` ticks) of the post-settle window during which we
+    /// keep re-asserting the overlay show, set at every settle and decremented each
+    /// tick. The fast single-window enter (#3) is the case the settle-time show does
+    /// not actually paint: on a real trackpad swipe `repositionOverlay` runs once but
+    /// leaves the overlay HIDDEN (`isVisible == false`) — or, more rarely, orders it
+    /// front before the Dock finishes compositing its layer-18 surface so it is stacked
+    /// underneath ("sunk") though `isVisible` reports true. The show happens once and,
+    /// with the cursor parked over the same window (an MC swipe never moves it), nothing
+    /// re-resolved (windowID unchanged), so it stayed hidden until the hovered window
+    /// changed (the user's "move out and back" recovery). This watch lets a *stationary*
+    /// cursor self-heal — re-anchoring a fresh window when hidden, and unconditionally at
+    /// a few forced ticks that span when the Dock may finish compositing; any cursor
+    /// MOVEMENT re-checks regardless of the countdown (see `trackMouse`).
+    private var sinkWatchTicks = 0
+
+    /// Suppresses overlay re-show after a *pass-through* left click — one that
+    /// dismisses Mission Control. MC's exit animation transiently re-tiles and
+    /// mis-reports window frames, so without this `trackMouse` re-shows the lights
+    /// (often anchored to a garbage top-left frame) for a frame or two before
+    /// `endSession`, flashing on the desktop right after MC closes. Self-clearing,
+    /// NOT a session-long latch: reset on session begin/end, plus a safety timer
+    /// (`suppressReshowTask`) so a click that leaves MC open (e.g. empty space)
+    /// can't strand the lights off for the rest of the session.
+    private var suppressOverlayReshow = false
+    private var suppressReshowTask: Task<Void, Never>?
+
+    /// After close/minimize, Mission Control re-tiles remaining thumbnails. Boost
+    /// window-list polling for a short window so overlay icons track the tiles
+    /// immediately instead of lagging behind Apple's animation.
+    private var postRetileBoostUntil: ContinuousClock.Instant?
+    private var postRetileBoostTask: Task<Void, Never>?
+
+    private var isRunning = false
+
+    init(
+        enumerator: any WindowEnumerating = CGWindowListEnumerator(),
+        performer: any WindowActionPerforming = AccessibilityWindowActionPerformer(),
+        capabilityResolver: any WindowCapabilityResolving = AccessibilityCapabilityResolver(),
+        actionsProvider: @escaping () -> [WindowAction],
+        chordProvider: @escaping (MissionControlShortcut) -> KeyChord? = { $0.defaultChord },
+        localeProvider: @escaping () -> Locale = { .current }
+    ) {
+        self.enumerator = enumerator
+        self.performer = performer
+        self.capabilityResolver = capabilityResolver
+        self.actionsProvider = actionsProvider
+        self.chordProvider = chordProvider
+        self.localeProvider = localeProvider
+    }
+
+    // MARK: - Lifecycle
+
+    func start() {
+        guard !isRunning else { return }
+        isRunning = true
+        Log.missionControl.notice("engine start")
+        // Cap the process-global AX messaging timeout: the system default
+        // (~1.5 s on macOS 26, 6 s historically) is how a busy hovered app used
+        // to freeze the MainActor for seconds inside one capability resolve.
+        // 1 s is the value alt-tab-macos, DockDoor, and yabai all converge on.
+        AXMessaging.capGlobalTimeout(seconds: 1.0)
+        armObserver()
+        installSpaceObserver()
+        startHealthPoll()
+        startLifecyclePoll()
+    }
+
+    func stop() {
+        guard isRunning else { return }
+        isRunning = false
+        Log.missionControl.notice("engine stop")
+        removeSpaceObserver()
+        healthTask?.cancel(); healthTask = nil
+        lifecycleTask?.cancel(); lifecycleTask = nil
+        observer.stop()
+        endSession()
+    }
+
+    /// (Re)attach the Dock `AXObserver`. Re-reading the Dock pid on every arm is
+    /// what lets the pipeline recover after the Dock relaunches or the observer
+    /// stops delivering across a full-screen Space transition. Cheap (a couple of
+    /// AX calls) and safe to call repeatedly.
+    private func armObserver() {
+        observer.stop()
+        observer.start { [weak self] state in
+            self?.handleStateChange(state)
+        }
+    }
+
+    private func handleStateChange(_ state: MissionControlState) {
+        guard state.showsWindowOverlays else {
+            // `AXExposeExit` / `AXExposeShowDesktop` are UNRELIABLE for teardown:
+            // a 3-finger trackpad swipe fires `AXExposeExit` while Mission Control
+            // stays open (even a swipe that changes no Space), which used to kill
+            // the overlay for the rest of the session — lights gone on every window
+            // until MC was reopened. So ignore them here; the close-poll (the Dock's
+            // exposé layer-18 surface) is the authority on a *real* close. The AX
+            // expose notifications are avoided entirely for teardown.
+            Log.missionControl.debug("MC state \(state.rawValue, privacy: .public) — ignored (close decided by poll)")
+            return
+        }
+        // Fast-path open: react instantly to the notification rather than waiting for
+        // the next poll tick. If a session is already live (the poll beat this laggy
+        // notification — it can arrive ~1 s after MC actually opened — or the Dock
+        // re-fired it), there is nothing to do: the poll and the frame-churn settle
+        // detector are authoritative for the running session, so resyncing here would
+        // only force a redundant same-position hide/re-show right as the lights settle.
+        // Real re-tiles (Space switch, boundary swipe) are caught by the churn detector;
+        // an actual Space change additionally re-syncs via `handleActiveSpaceChange`.
+        guard !sessionActive else { return }
+        beginSession()
+    }
+
+    // MARK: - Session
+
+    /// Stand the session resources up fresh. Both call sites are guarded by
+    /// `sessionActive` (the notification fast-path returns early; the lifecycle poll
+    /// only begins when inactive), so this never double-starts. A repeat open is
+    /// simply ignored; a live Space change re-syncs via `resyncSession` from
+    /// `handleActiveSpaceChange`.
+    private func beginSession() {
+        if let until = suppressSessionRestartUntil {
+            if ContinuousClock.now < until {
+                Log.missionControl.debug("session begin suppressed during maximize transition")
+                return
+            }
+            suppressSessionRestartUntil = nil
+        }
+        sessionActive = true
+        sessionGeneration += 1
+        // The session can be opened by the AX-expose fast-path before the lifecycle
+        // poll next ticks; assume the surface is present so the first in-MC shortcut
+        // isn't blocked for up to a poll interval. The poll keeps it honest.
+        mcSurfacePresent = true
+        resetSettleState() // keep the lights hidden until MC finishes entering
+        windowFrames = [:]
+        capabilityCache = [:]
+        backgroundResolveRounds = [:] // fresh retry budget; in-flight ids clear at merge
+        awaitFreshHoverAfterClick = false
+        loggedPrewarmAllDark = false
+        // Do NOT seed `lastMouseLocation` here: it stays `nil` (from `endSession`) so the
+        // first resolve once the layout settles always shows the lights even with a
+        // stationary cursor — a Mission Control swipe never moves the cursor, so seeding
+        // it used to block that first show (the "lights occasionally don't appear on a
+        // normal enter" bug). Keeping the paused-mid-swipe dark is the exact
+        // frame-stability settle gate's job (`layoutSettled`), not the cursor guard.
+        clearReshowSuppression() // fresh MC session — lights live again
+        pivotHeight = Self.menuBarScreenHeight()
+        refreshWindows()
+        Log.missionControl.notice("session begin (windows=\(self.windows.count, privacy: .public))")
+
+        let tapOK = tap.start(handlers: EventTap.Handlers(
+            onClick: { [weak self] point in self?.handleClick(at: point) ?? true },
+            onSecondaryClick: { [weak self] point in self?.handleSecondaryClick(at: point) ?? true },
+            onKey: { [weak self] code, flags in self?.handleKey(code, flags) ?? true }
+        ))
+        if !tapOK {
+            Log.missionControl.error("event tap FAILED — Accessibility not granted to THIS binary (MissionController). Buttons will not work until it is enabled in System Settings.")
+        }
+
+        // Track the hovered thumbnail and periodically refresh the window list
+        // (Mission Control re-tiles thumbnails away from real positions). Keep the
+        // refresh cadence deliberately below the old 35 ms/70 ms burst rates:
+        // CGWindowListCopyWindowInfo is a WindowServer query, and hammering it while
+        // Mission Control is animating can add compositor pressure and make the native
+        // thumbnail transition visibly stutter or land between layouts. Cancel
+        // any stragglers first so a re-begin can never leak a second loop.
+        mouseTask?.cancel()
+        mouseTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                self?.trackMouse()
+                let boost = self?.isInPostRetileBoost == true
+                try? await Task.sleep(for: boost ? .milliseconds(50) : .milliseconds(60))
+            }
+        }
+        fetchTask?.cancel()
+        fetchTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                // Moderately faster while MC is re-tiling after a close; normal otherwise.
+                let boost = self?.isInPostRetileBoost == true
+                try? await Task.sleep(for: boost ? .milliseconds(70) : .milliseconds(100))
+                guard !Task.isCancelled else { return }
+                self?.refreshWindows()
+            }
+        }
+    }
+
+    /// Mission Control draws an exposé surface for the whole time it is visible —
+    /// Dock-owned at **layer 18** on macOS ≤26, WindowManager-owned at **layer
+    /// 19** on macOS 27+ (Golden Gate moved it; see `MissionControlSurface`) —
+    /// and polling for it is a *reliable* "is MC open?" signal. We drive the
+    /// session on this, not on the AX expose notifications, which the Dock fires
+    /// spuriously during trackpad swipes on ≤26 and stopped posting entirely on
+    /// 27 (so there the poll is the ONLY open detection). Matched by pid (owner
+    /// names are localized — "程序坞" etc.) so it is locale-independent.
+    /// Whether an exposé surface is on screen right now is read in ONE
+    /// `CGWindowList` pass. This is the authority for opening AND ending a
+    /// session. Matched against the LIVE pids, not the observer's
+    /// `armedDockPID`: the latter is `nil` until the AXObserver has armed and goes
+    /// stale across a Dock relaunch, so coupling detection to it blinds opens
+    /// during a Dock-down-at-launch race until the ~2 s health poll re-arms; the
+    /// live pids self-heal immediately.
+    private func missionControlSurfacePresent() -> Bool {
+        let dockPID = MissionControlObserver.currentDockPID()
+        let windowManagerPID = MissionControlObserver.currentWindowManagerPID()
+        guard dockPID != nil || windowManagerPID != nil else { return false }
+        let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        return MissionControlSurface.exposeSurfacePresent(
+            in: info, dockPID: dockPID, windowManagerPID: windowManagerPID
+        )
+    }
+
+    /// The authority on the session lifecycle (runs for the whole engine lifetime).
+    /// Begins the moment MC is shown and ends once it is *really* gone. A trackpad
+    /// swipe momentarily tears the exposé surface down and rebuilds it (~1 s); the
+    /// session simply re-begins on the next tick, so the overlay self-heals instead
+    /// of dying — including a swipe past the last desktop that changes no Space and
+    /// emits no re-open notification.
+    private func startLifecyclePoll() {
+        lifecycleTask?.cancel()
+        var closeMisses = 0
+        lifecycleTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.isRunning else { return }
+                // Backstop cadence: stay fast (120 ms) whenever the overlay can do
+                // anything — a live session OR Accessibility granted (the AX-expose
+                // notification can lag ~1 s, so the poll is what opens quickly). Back
+                // off to a slow idle keepalive ONLY when untrusted AND idle, where the
+                // feature is inert and fast polling is pure battery waste. The engine
+                // restarts on grant and this re-checks each tick, so it speeds back up.
+                let fast = self.sessionActive || AXIsProcessTrusted()
+                try? await Task.sleep(for: fast ? .milliseconds(150) : .seconds(5))
+                guard !Task.isCancelled, self.isRunning else { return }
+                let surfacePresent = self.missionControlSurfacePresent()
+                // Track the live surface so in-MC interception (handleKey / button
+                // clicks) is active exactly while MC is on screen — `beginSession`
+                // seeds it true for the AX-expose fast-path, and this keeps it honest.
+                self.mcSurfacePresent = surfacePresent
+                if surfacePresent {
+                    closeMisses = 0
+                    self.surfaceSeenThisSession = true
+                    if !self.sessionActive { self.beginSession() }
+                } else if self.sessionActive {
+                    // Surface gone — stop intercepting shortcuts immediately (above),
+                    // and tear the session down once it has stayed gone past the
+                    // close-miss debounce.
+                    closeMisses += 1
+                    if closeMisses >= 5 { // ~600 ms gone — a genuine close
+                        // Field tripwire: an AX-notification-opened session that the
+                        // poll never once confirmed means the layer-18 signal itself
+                        // is broken on this OS — dump the layer landscape before the
+                        // teardown wipes the state (see `surfaceSeenThisSession`).
+                        if !self.surfaceSeenThisSession { self.logExposeSurfaceNeverSeen() }
+                        Log.missionControl.notice("lifecycle-poll: Mission Control gone → end session")
+                        self.endSession()
+                    }
+                }
+            }
+        }
+    }
+
+    /// Field tripwire body: one `.notice` dump of every non-standard-layer window
+    /// (`owner(pid)@layer:WxH`), fired at the teardown of a session the poll never
+    /// confirmed. Mission Control is typically still on screen at this moment (the
+    /// session exists because the AX notification saw it open), so if a macOS
+    /// release moved the exposé surface off Dock/layer-18, its new home is in this
+    /// line — enough to re-pin `MissionControlSurface` remotely from a user's
+    /// `log show` output alone.
+    private func logExposeSurfaceNeverSeen() {
+        let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+        let summary = MissionControlSurface.layerDiagnostic(in: info)
+        Log.missionControl.notice("expose surface never seen this session — non-zero-layer windows: \(summary, privacy: .public)")
+    }
+
+    /// Re-pick the Y-flip pivot and hide the stale overlay until the now-active
+    /// space's window list lands; `trackMouse` rebuilds geometry on the next tick.
+    private func resyncSession() {
+        pivotHeight = Self.menuBarScreenHeight()
+        resetSettleState() // the new space re-tiles — hide until it settles
+        hovered = nil
+        retireOverlayWindow()
+        refreshWindows()
+        Log.missionControl.debug("resync: windows=\(self.windows.count, privacy: .public) pivot=\(Int(self.pivotHeight), privacy: .public)")
+    }
+
+    /// Idempotent teardown. Note it does **not** touch `spaceObserver` /
+    /// `healthTask` — those live for the whole engine lifetime so a re-arm can
+    /// still fire after Mission Control closes.
+    private func endSession() {
+        let wasLive = mouseTask != nil
+        sessionActive = false
+        mcSurfacePresent = false
+        surfaceSeenThisSession = false
+        windowFrames = [:]
+        capabilityCache = [:]
+        backgroundResolveRounds = [:] // in-flight ids clear at merge (guarded by sessionActive)
+        awaitFreshHoverAfterClick = false
+        resetSettleState()
+        lastMouseLocation = nil
+        clearReshowSuppression() // MC closed; nothing left to re-show
+        mouseTask?.cancel(); mouseTask = nil
+        fetchTask?.cancel(); fetchTask = nil
+        postRetileBoostTask?.cancel(); postRetileBoostTask = nil
+        postRetileBoostUntil = nil
+        // NB: do NOT cancel `lifecycleTask` here — it runs for the engine's whole
+        // lifetime and is what re-opens the session when MC comes back.
+        tap.stop()
+        clearOverlayContent()
+        hovered = nil
+        hoverState.hoveredIndex = nil
+        if wasLive { Log.missionControl.notice("session end") }
+    }
+
+    /// Reset the settle/sink-watch gate to its session-start state: layout not yet
+    /// settled, no consecutive still refreshes counted, and no post-settle re-anchor
+    /// watch pending.
+    private func resetSettleState() {
+        layoutSettled = false
+        stableTicks = 0
+        sinkWatchTicks = 0
+        churnTicks = 0
+        loggedChurnStarvation = false
+        degradedSettle = false
+    }
+
+    // MARK: - Recovery observers (Space change / Dock relaunch)
+
+    private func installSpaceObserver() {
+        guard spaceObserver == nil else { return }
+        spaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleActiveSpaceChange() }
+        }
+    }
+
+    private func removeSpaceObserver() {
+        if let spaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(spaceObserver)
+            self.spaceObserver = nil
+        }
+    }
+
+    private func handleActiveSpaceChange() {
+        guard isRunning else { return }
+        Log.missionControl.debug("active space changed → re-arm observer (sessionActive=\(self.sessionActive ? "y" : "n", privacy: .public))")
+        // Re-arm the Dock observer: it can stop delivering after a transition into
+        // a full-screen app's Space (and re-reading the pid also covers a Dock
+        // relaunch). Idempotent + cheap; the next open re-fires through the fresh
+        // observer.
+        armObserver()
+        // Overlay recovery across a Space change is handled uniformly by the
+        // re-tile detector in `refreshWindows` (thumbnail-frame churn → rebuild the
+        // overlay window once the layout settles), which ALSO covers the
+        // no-Space-change boundary swipe that fires no `activeSpaceDidChange`. Here
+        // we only hide the now-stale overlay until that settle; the rebuilt window
+        // orders in ABOVE the Dock's re-tiled exposé surface (a reused one stays
+        // sunk while still reporting a false `visible=y`).
+        if sessionActive { resyncSession() }
+    }
+
+    private func startHealthPoll() {
+        healthTask?.cancel()
+        healthTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(12))
+                guard let self, !Task.isCancelled, self.isRunning else { return }
+                self.checkDockHealth()
+            }
+        }
+    }
+
+    /// Re-arm if the Dock pid changed under us (a crash/restart). Only acts on an
+    /// actual change, so it never drops a pending notification by re-arming
+    /// needlessly. The full-screen-Space wedge (pid unchanged but the observer
+    /// went deaf) is covered separately by the `activeSpaceDidChange` re-arm.
+    private func checkDockHealth() {
+        let live = MissionControlObserver.currentDockPID()
+        let armed = observer.armedDockPID
+        guard let live, live != armed else { return }
+        Log.missionControl.notice("Dock pid changed \(armed.map(String.init) ?? "nil", privacy: .public)→\(live, privacy: .public) → re-arm observer")
+        armObserver()
+    }
+
+    private func refreshWindows() {
+        let overlayID = overlayWindow.map { CGWindowID($0.windowNumber) }
+        // Exclude system owners by PID: `kCGWindowOwnerName` is LOCALIZED ("程序坞",
+        // …), so the name-based exclusion silently misses on every non-English
+        // system and the owner's layer-0 surface joins the hover candidates —
+        // hovering it resolves no AX window and the lights go dark. The name
+        // set stays as an English-system belt-and-suspenders only.
+        // WindowManager joins the exclusion for macOS 27: while MC is open it
+        // draws a layer-0 hover-highlight window a few px LARGER than, and on
+        // top of, whichever thumbnail the cursor is over (verified on 26A5368g:
+        // 987x750 chrome around a 975x737 thumbnail) — without the pid
+        // exclusion `frontmost(containing:)` resolves that chrome for EVERY
+        // hovered thumbnail and the lights stay dark on all of them, the same
+        // failure class as the localized-Dock bug.
+        let dockPID = MissionControlObserver.currentDockPID()
+        let windowManagerPID = MissionControlObserver.currentWindowManagerPID()
+        windows = enumerator.actionableWindows(
+            excludingOwners: ["Dock", "WindowManager"],
+            excludingPIDs: Set([dockPID, windowManagerPID].compactMap(\.self))
+        )
+            .filter { window in
+                // Never the overlay window itself (it is a high-level window,
+                // normally already dropped by the layer-0 filter — belt-and-suspenders).
+                guard window.windowID != overlayID else { return false }
+                // Keep real foreground apps (.regular) AND menu-bar/agent apps
+                // (.accessory / LSUIElement) — the latter still show genuine
+                // document/Settings windows as Mission Control thumbnails, so
+                // dropping them was a coverage gap. CloseUp's own
+                // windows (also .accessory) are included for the same reason. Only
+                // .prohibited system surfaces (wallpaper / WindowServer — the stray
+                // top-left cluster) are excluded; that coarse gate still matters in
+                // the AX-untrusted path, where the capability resolver returns nil.
+                return window.ownerPID == ownPID || Self.isOverlayableApp(window.ownerPID)
+            }
+            // Drop windows CGWindowList transiently reports off-screen while
+            // Mission Control re-tiles after a Space switch, so such a mis-placed
+            // window can't shadow the real one under the cursor and anchor the
+            // overlay off-screen (the "no lights after swiping" bug).
+            .anchoredOnScreen(displays: Self.activeDisplayBoundsCG(), inset: OverlayGeometry.edgeInset)
+
+        // Prewarm + heal: resolve capabilities for any not-yet-cached window off
+        // the main actor. At session begin this front-loads the per-app AX
+        // warm-up (~25–45 ms each) so it is usually done before the first hover;
+        // on later ticks it retries blank windows (bounded) and covers windows
+        // that appear mid-session. The filter inside makes the steady state a
+        // cheap no-op.
+        if sessionActive { requestBackgroundResolve(windows) }
+
+        // Gate the overlay on the thumbnail layout being SETTLED, detected by
+        // frame churn. The same mechanism covers Mission Control's *enter* animation
+        // and any later re-tile (Space switch, boundary swipe, full-screen transition):
+        // while the thumbnails are moving the overlay stays hidden — showing it then
+        // makes the lights chase the moving window (the "lights appear before MC
+        // settles" bug) — and the moment the layout holds still we rebuild the overlay
+        // window once (a fresh window orders in ABOVE the Dock's rebuilt exposé surface;
+        // a reused one stays sunk and reports a false `visible=y`) and re-anchor it to
+        // the settled position. Frame churn is also the only signal that catches the
+        // no-Space-change boundary swipe (which fires neither `activeSpaceDidChange` nor
+        // an exposé-surface change), and re-anchoring keeps the lights aligned after
+        // the animation.
+        let newFrames = Dictionary(windows.map { ($0.windowID, $0.frame) }, uniquingKeysWith: { first, _ in first })
+        let hadBaseline = !windowFrames.isEmpty
+        let churning = ThumbnailLayout.didRetile(
+            from: windowFrames, to: newFrames,
+            tolerance: degradedSettle ? Self.degradedSettleTolerancePx : 0
+        )
+        let oldFrames = windowFrames // kept one tick for the starvation tripwire's churn sample
+        windowFrames = newFrames
+        // The first refresh of a session only establishes the baseline — there is
+        // nothing to compare against yet, so it is neither churning nor settled.
+        guard sessionActive, hadBaseline else { return }
+
+        if churning {
+            // Thumbnails are moving — Mission Control's enter animation or a re-tile.
+            // Hide the lights and wait: showing them now makes the overlay chase the
+            // moving window (the visible bug). They re-appear once the layout settles.
+            stableTicks = 0
+            sinkWatchTicks = 0
+            if layoutSettled {
+                layoutSettled = false
+                retireOverlayWindow()
+                self.hovered = nil
+                Log.missionControl.debug("layout churning → hide overlay until settle")
+            }
+            // Field tripwire + SELF-HEAL: no real MC enter/re-tile churns this long —
+            // sustained churn means the settle gate is being starved (an OS keeping
+            // thumbnails in perpetual micro-motion, e.g. macOS 27's re-animated
+            // Mission Control) and the lights would never show. Log one `.notice`
+            // with a movement sample (retrievable post-hoc via `log show`), then
+            // switch churn judgment to the degraded tolerance so micro-jitter reads
+            // as settled and the lights recover through the normal settle path a few
+            // ticks later. If even the tolerant compare keeps reading churn, the
+            // layout is genuinely moving (>2 px/tick sustained) and showing lights
+            // would chase it — correctly stays hidden.
+            churnTicks += 1
+            if !loggedChurnStarvation, churnTicks >= Self.churnStarvationTicks {
+                loggedChurnStarvation = true
+                degradedSettle = true
+                churnTicks = 0
+                let sample = ThumbnailLayout.churnSample(from: oldFrames, to: newFrames)
+                Log.missionControl.notice("layout never settled — churning \(Self.churnStarvationTicks, privacy: .public) consecutive refreshes (~\(Self.churnStarvationTicks / 10, privacy: .public) s), falling back to degraded settle (tolerance \(Self.degradedSettleTolerancePx, privacy: .public)px): \(sample, privacy: .public)")
+            }
+        } else if !layoutSettled {
+            churnTicks = 0
+            stableTicks += 1
+            if stableTicks >= Self.settleTicks { // held still → MC has finished tiling
+                layoutSettled = true
+                Log.missionControl.notice("layout settled → show overlay (windows=\(self.windows.count, privacy: .public))")
+                // Clear the cursor guard so the very next resolve always shows, even with
+                // a stationary cursor (the cursor never moves during an MC swipe). This is
+                // what fixes the "lights occasionally don't appear on a normal enter" bug;
+                // the unseeded guard then only suppresses redundant re-resolves on later
+                // ticks. Applies equally to every re-tile's re-settle within a session.
+                lastMouseLocation = nil
+                // Re-assert the show for the next ~1.8 s: on a real trackpad swipe the
+                // recreate below can leave the overlay hidden, or lose the z-order race
+                // while the Dock keeps compositing its surface after the thumbnail
+                // frames settled (the single-window case, #3). `trackMouse` re-anchors
+                // a fresh window each tick it is hidden, plus at a few forced ticks, so
+                // the lights land once the Dock has finished entering.
+                sinkWatchTicks = Self.sinkWatchTickBudget
+                // Retire the overlay window so the next show orders in a FRESH one
+                // ABOVE the Dock's settled exposé surface (a window ordered-in before
+                // the tiling finished stays sunk while reporting a false `visible=y`),
+                // then anchor on the hover.
+                retireOverlayWindow()
+                self.hovered = nil
+                trackMouse() // re-anchor on a fresh window now, no inter-tick gap
+            }
+        }
+    }
+
+    /// How many consecutive still refreshes (~100 ms each) mark the layout as
+    /// "settled". One (~55 ms) shows the overlay as soon as a refresh reports a
+    /// still layout — prioritises snappy appearance over absorbing a single mid-flight pause.
+    private static let settleTicks = 1
+
+    /// Consecutive churning refreshes (~100 ms each) after which the settle gate is
+    /// considered STARVED: the tripwire logs its one-shot churn sample and the
+    /// engine falls back to degraded settle. ~5 s: comfortably beyond any real
+    /// Mission Control enter or re-tile animation, so it can only fire when the
+    /// layout genuinely never comes to rest — the one healthy-system way to reach
+    /// it is holding a paused interactive scrub for 5+ s, where showing the lights
+    /// is acceptable (the original "paused swipe shows early" bug was an
+    /// IMMEDIATE show on every brief pause, not a 5 s hold).
+    private static let churnStarvationTicks = 50
+
+    /// Per-edge integer-pixel movement still treated as "holding still" in
+    /// degraded-settle mode. 2 px: absorbs ease-out tails and animation
+    /// micro-jitter (sub-2 px/100 ms), while a real re-tile — tens of pixels per
+    /// tick — still reads as churn and keeps the overlay hidden mid-animation.
+    private static let degradedSettleTolerancePx = 2
+
+    /// How many `trackMouse` ticks (~35 ms each) after a settle to keep re-asserting
+    /// the overlay show. ~30 ticks (~1.8 s) comfortably outlasts the Dock finishing
+    /// its enter composite on a real trackpad swipe, so a *stationary* cursor
+    /// self-heals the fast-enter no-show (#3); after it elapses, only cursor movement
+    /// re-checks (steady-state, zero cost).
+    private static let sinkWatchTickBudget = 16
+
+    /// Ticks (since settle) at which to re-anchor the overlay UNCONDITIONALLY during
+    /// the watch, on top of the every-tick "hidden" recovery. A window we just ordered
+    /// front can read as front-most in CGWindowList and as `isVisible` while the Dock
+    /// still composites its surface visually over it, so neither the hidden check nor
+    /// z-order detection catches that case; these spread-out forced re-anchors land a
+    /// fresh window across the range of moments the Dock may finish its composite (#3).
+    private static let forcedReanchorTicks: Set<Int> = [4, 10, 15]
+
+    /// Active display bounds in CG (top-left origin) coordinates — the same space
+    /// `CGWindowList` frames use — so window frames can be tested for being on a
+    /// real display.
+    private static func activeDisplayBoundsCG() -> [CGRect] {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return [] }
+        return ids.prefix(Int(count)).map { CGDisplayBounds($0) }
+    }
+
+    // MARK: - Hover tracking
+
+    private func trackMouse() {
+        // Until Mission Control has finished entering (or re-tiling), keep the overlay
+        // hidden — otherwise the lights chase the still-moving thumbnails (the visible
+        // "lights appear before MC settles" bug). The settle detector in
+        // `refreshWindows` flips `layoutSettled` and calls back here to anchor on the
+        // now-stable layout.
+        guard layoutSettled else { return }
+        guard let location = CGEvent(source: nil)?.location else { return }
+        let cursorMoved = lastMouseLocation != location
+        lastMouseLocation = location
+        // Steady-state early-out: the cursor is parked,
+        // a window is already resolved, and we are past the post-settle window in which
+        // the show could still have failed to paint — so there is nothing to do. We must
+        // NOT take this early-out while `sinkWatchTicks > 0` (a stationary cursor over an
+        // overlay that didn't paint has to be able to recover, #3) nor while nothing is
+        // resolved yet (`hovered == nil`, so a first transient miss keeps retrying).
+        if !cursorMoved, hovered != nil, sinkWatchTicks == 0 { return }
+        if sinkWatchTicks > 0 { sinkWatchTicks -= 1 }
+
+        // The traffic-light cluster STRADDLES the thumbnail's top edge, so its outer
+        // half sits ABOVE the hovered window's frame (`clusterFrameCG.minY` is
+        // `windowFrame.minY - buttonSize/2 - clusterPadding`). A cursor moving onto
+        // that outer half is no longer "inside" the window per `frontmost(containing:)`,
+        // which would resolve to nil (or whatever sits above) and tear the lights down
+        // the instant the pointer reaches for the part hanging off the thumbnail — the
+        // "lights vanish on the outside half" bug. While the cursor is over the CURRENT
+        // overlay's cluster, keep the current window resolved: the cluster belongs to it,
+        // so hovering its buttons must never switch or hide it. (`geometry` is non-nil
+        // only while that window's lights are shown, and always describes `hovered`.)
+        // This matches how a native title bar feels — its controls stay active while
+        // the pointer is on the half hanging off the thumbnail's top edge.
+        let overCurrentCluster = geometry?.clusterFrameCG.contains(location) ?? false
+        // First-acquisition also covers the cluster's straddle band (it hangs
+        // `OverlayGeometry.topOverhang` above the thumbnail's top edge), so a
+        // window lights up when the cursor first reaches for the off-thumbnail half
+        // of its controls — not only once it is already hovered (the
+        // `overCurrentCluster` keep-case). Matches the zone the cluster occupies.
+        let newHover = (overCurrentCluster && hovered != nil)
+            ? hovered
+            : windows.frontmost(
+                containing: location,
+                topOverhang: OverlayGeometry.topOverhang,
+                leftOverhang: OverlayGeometry.cornerOverhang + OverlayGeometry.clusterPadding
+            )
+        if newHover?.windowID != hovered?.windowID {
+            Log.missionControl.debug("hover \(self.hovered?.windowID ?? 0, privacy: .public)→\(newHover?.windowID ?? 0, privacy: .public) cgMouse=(\(Int(location.x), privacy: .public),\(Int(location.y), privacy: .public)) windows=\(self.windows.count, privacy: .public)")
+            awaitFreshHoverAfterClick = false // a fresh hover — passive re-shows are live again
+            hovered = newHover
+            repositionOverlay()
+        } else if hovered != nil, !suppressOverlayReshow, sinkWatchTicks > 0 {
+            // Same window, still inside the post-settle watch. The fast single-window
+            // enter (#3) is the case the settle-time show did not actually paint: on a
+            // real trackpad swipe `repositionOverlay` runs once but the overlay does not
+            // end up on screen (left hidden, or ordered front before the Dock finished
+            // compositing its layer-18 surface so it is stacked underneath). The show
+            // happens once and, with the cursor parked over the same window (an MC swipe
+            // never moves it), nothing re-resolved (windowID unchanged) — so it stayed
+            // missing until the hovered window changed (the user's "move out and back"
+            // recovery). Re-anchor a FRESH window (make-before-break, blink-free) at a
+            // few forced ticks that span when the Dock may finish its composite; a fresh
+            // window ordered-in after the surface lands above it. A just-ordered-front
+            // window can read as front-most in CGWindowList and as `isVisible` while
+            // still visually underneath, so re-anchoring is unconditional rather than
+            // gated on a (then-unreliable) on-top check. The forced ticks stop firing
+            // once the watch elapses (~1.8 s), by which point the layout is at rest.
+            let watchTick = Self.sinkWatchTickBudget - 1 - sinkWatchTicks
+            if Self.forcedReanchorTicks.contains(watchTick) {
+                Log.missionControl.debug("overlay re-anchor (forced tick=\(watchTick, privacy: .public))")
+                reanchorOverlayAboveSurface()
+            }
+        }
+        // The overlay window ignores mouse events, so drive per-button hover
+        // from here. Only assign on change to avoid 60 Hz re-render churn.
+        let index = geometry?.hitTest(location)
+        if hoverState.hoveredIndex != index { hoverState.hoveredIndex = index }
+    }
+
+    /// Re-anchor the overlay ABOVE the Dock's exposé surface without a visible blink.
+    /// Every show already orders in a FRESH window and retires the old one only AFTER
+    /// the new one is showing (`presentOverlay`, make-before-break), and a window
+    /// ordered-in after the surface has settled lands on top — so a plain re-show is
+    /// the whole re-anchor, and the lights never flicker.
+    private func reanchorOverlayAboveSurface() {
+        guard !suppressOverlayReshow, hovered != nil else { return }
+        repositionOverlay()
+    }
+
+    private func repositionOverlay() {
+        // A pass-through click is dismissing Mission Control; keep the overlay hidden
+        // through the exit animation's frame churn so it doesn't flash back on (often
+        // at a garbage top-left position) before the session ends.
+        guard !suppressOverlayReshow else {
+            retireOverlayWindow()
+            return
+        }
+        guard let hovered else {
+            clearOverlayContent()
+            return
+        }
+        // Settings-enabled actions narrowed to the controls this window actually
+        // has (resolved via AX). A popover / sheet / chrome-less panel exposes no
+        // title-bar buttons → empty → no overlay (fixes lights on popups). When
+        // Accessibility is unavailable the policy display is nil and we fall back
+        // to showing every enabled action (the legacy no-AX behaviour).
+        // CACHE-FIRST: a window resolved once this session pays zero AX IPC here
+        // — the session prewarm usually fills the cache before the first hover,
+        // so a hover change shows in the same tick with no app round-trip. On a
+        // miss, resolve synchronously (bounded by the 1 s global AX messaging
+        // cap); a blank outcome is healed by the bounded background retries,
+        // whose merge re-shows this window the moment real buttons resolve.
+        let requested = actionsProvider()
+        let effective: WindowCapabilities?
+        if let cached = capabilityCache[hovered.windowID] {
+            // Fast path: a window already warmed this session costs zero AX IPC.
+            effective = cached
+        } else if backgroundResolveInFlight.contains(hovered.windowID) {
+            // Never block the MainActor waiting for AX. The background prewarm is
+            // already working on this window; keep the UI responsive and use the
+            // enabled-action set as a temporary optimistic display. If AX later
+            // reports that a control does not exist, the merge path immediately
+            // corrects the overlay. This removes the old ~1 s hover hitch when an
+            // app is busy during Mission Control entry.
+            effective = nil
+        } else {
+            // The background resolver may have missed a newly-created window. Queue
+            // it and stay non-blocking rather than performing AX synchronously on
+            // the main actor.
+            requestBackgroundResolve([hovered])
+            effective = nil
+        }
+        let actions = effective?.supported(from: requested) ?? requested
+        guard !actions.isEmpty else {
+            clearOverlayContent()
+            return
+        }
+        currentActions = actions
+        let geo = OverlayGeometry(windowFrame: hovered.frame, actionCount: actions.count, pivotHeight: pivotHeight)
+        geometry = geo
+        presentOverlay(geo, actions: actions)
+    }
+
+    /// Put the cluster on screen at `geo` — always on a FRESH window born at its final
+    /// frame, never by moving the one already showing. While Mission Control is open
+    /// the system implicitly animates a visible window's frame change (verified
+    /// frame-by-frame on macOS 27 and in the #6 recording: ~300 ms glide), so
+    /// `setFrame` on the live overlay made the lights slide from the old thumbnail to
+    /// the new one on every hover change. Native Mission Control's controls hide and
+    /// re-appear instead, so the shown window is immutable: build the new one at the
+    /// target frame, order it front, and only THEN retire the old one
+    /// (make-before-break — no dark gap, no flicker; the same recipe the post-settle
+    /// re-anchor relies on to land above the exposé surface).
+    /// Creating the window at its final `contentRect` also keeps the hosting view's
+    /// FIRST layout its final one — the fix for the "lights fly in from the top-left"
+    /// bug, where content mounted into a `.zero` window and then animated out as the
+    /// window grew — with no `setFrame` at all.
+    private func presentOverlay(_ geo: OverlayGeometry, actions: [WindowAction]) {
+        let retired = overlayWindow
+        let window = makeOverlayWindow(at: geo.nsWindowFrame)
+        window.contentView = NSHostingView(rootView: OverlayClusterView(actions: actions, locale: localeProvider(), hoverState: hoverState))
+        window.orderFront(nil)
+        overlayWindow = window
+        retired?.orderOut(nil)
+        retired?.close()
+        let f = geo.nsWindowFrame
+        Log.missionControl.debug("overlay show win=\(window.windowNumber, privacy: .public) actions=\(actions.count, privacy: .public) ns=(\(Int(f.minX), privacy: .public),\(Int(f.minY), privacy: .public) \(Int(f.width), privacy: .public)x\(Int(f.height), privacy: .public)) visible=\(window.isVisible ? "y" : "n", privacy: .public) onActiveSpace=\(window.isOnActiveSpace ? "y" : "n", privacy: .public) screen=\(window.screen != nil ? "y" : "n", privacy: .public)")
+    }
+
+    // MARK: - Background capability resolution (prewarm + heal)
+
+    /// Queue an off-main-actor capability resolve for any of `candidates` not
+    /// already cached, in flight, or out of retry budget. Two jobs share this:
+    /// the session PREWARM (all windows, from `refreshWindows`) that moves the
+    /// per-app AX warm-up cost off the hover path, and the bounded RETRY loop
+    /// that heals a window whose resolve came back blank — transiently-failing
+    /// windows used to stay dark until the cursor left and came back, because
+    /// nothing on the tick path re-resolves a parked hover.
+    private func requestBackgroundResolve(_ candidates: [WindowInfo]) {
+        let fresh = candidates.filter { window in
+            capabilityCache[window.windowID] == nil
+                && !backgroundResolveInFlight.contains(window.windowID)
+                && backgroundResolveRounds[window.windowID, default: 0] < Self.maxBackgroundResolveRounds
+        }
+        guard !fresh.isEmpty else { return }
+        for window in fresh { backgroundResolveInFlight.insert(window.windowID) }
+        let generation = sessionGeneration
+        // Detached: the batch resolve blocks its thread on AX IPC (bounded by
+        // the 1 s global cap per read) — exactly what must never run on the
+        // MainActor. Results and inputs are Sendable value types.
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let resolutions = AccessibilityCapabilityResolver.resolutions(for: fresh)
+            await MainActor.run { self?.mergeBackgroundResolutions(resolutions, generation: generation) }
+        }
+    }
+
+    /// Fold one background batch into the session cache, and re-show the hovered
+    /// window if it just resolved real buttons while displaying nothing — a
+    /// parked cursor never re-resolves on the tick path (the steady-state
+    /// early-out), so this merge is what heals the stuck-dark hover.
+    private func mergeBackgroundResolutions(_ resolutions: [CGWindowID: CapabilityResolution], generation: Int) {
+        for id in resolutions.keys { backgroundResolveInFlight.remove(id) }
+        guard sessionActive, generation == sessionGeneration else { return }
+        var hoveredResolved = false
+        var hoveredBecameButtonless = false
+        for (id, resolution) in resolutions {
+            if case .unavailable = resolution {
+                // AX untrusted: no background resolve can ever succeed, so burn
+                // the whole retry budget — otherwise the fetch tick re-queues
+                // every window every ~100 ms for the entire untrusted session.
+                backgroundResolveRounds[id] = Self.maxBackgroundResolveRounds
+                continue
+            }
+            let outcome = OverlayCapabilityPolicy.outcome(for: resolution)
+            if let cache = outcome.cache {
+                if capabilityCache[id] == nil {
+                    capabilityCache[id] = cache
+                    // The hover may have been displayed optimistically while AX
+                    // was warming. Reconcile it now without making the user move
+                    // the pointer away and back.
+                    if id == hovered?.windowID { hoveredResolved = true }
+                }
+                backgroundResolveRounds[id] = nil
+            } else if case .resolved(.none) = resolution, id == hovered?.windowID {
+                // The optimistic fast path can briefly show enabled controls while
+                // AX is resolving. If AX authoritatively says this is a buttonless
+                // surface, remove those controls immediately.
+                hoveredBecameButtonless = true
+                backgroundResolveRounds[id, default: 0] += 1
+            } else if outcome.retry {
+                backgroundResolveRounds[id, default: 0] += 1 // blank — spend one retry round
+            }
+        }
+        if hoveredBecameButtonless, geometry != nil, !awaitFreshHoverAfterClick {
+            clearOverlayContent()
+        }
+        // NB `awaitFreshHoverAfterClick`: never re-light the window the user
+        // just clicked a button on — that re-show belongs to the next fresh
+        // hover only (the "post-click flash" rule).
+        if hoveredResolved, layoutSettled, geometry == nil, !suppressOverlayReshow, !awaitFreshHoverAfterClick {
+            repositionOverlay()
+        }
+        // Field tripwire: a batch of several real thumbnails where NOT ONE window
+        // resolved a button — and nothing else cached this session either — is
+        // the fingerprint of the AX matching pipeline breaking OS-wide
+        // (`_AXUIElementGetWindow` unpaired, or trusted-but-failing reads): the
+        // overlay then stays dark on EVERY window while permission looks fine.
+        // One `.notice` line per session, retrievable post-hoc via `log show`
+        // (the per-app `capability resolve` `.debug` lines are not persisted).
+        // ≥3 windows so a lone genuine popover batch can't false-positive.
+        if !loggedPrewarmAllDark, capabilityCache.isEmpty, resolutions.count >= 3 {
+            let summary = CapabilityBatchSummary(of: resolutions.values)
+            if summary.isAllDark {
+                loggedPrewarmAllDark = true
+                Log.missionControl.notice("capability prewarm ALL-DARK (\(summary.logDescription, privacy: .public)) — AX trusted but no window resolved buttons")
+            }
+        }
+    }
+
+    /// Hide the overlay window and drop the resolved geometry + action mapping. The
+    /// shared "clear the overlay" sequence for the no-window / no-actions paths.
+    private func clearOverlayContent() {
+        retireOverlayWindow()
+        geometry = nil
+        currentActions = []
+    }
+
+    // MARK: - Click & key handling
+
+    /// If `point` lands on a traffic-light button (and Mission Control is genuinely
+    /// open), perform that action, hide the overlay, and return `true` (consumed).
+    /// Returns `false` with no side effects when it was not a button hit. MC stays
+    /// open, so we do NOT latch — the lights re-appear on the next *fresh* hover,
+    /// letting the user keep managing windows (close one, hover the next).
+    private func performButtonHit(at point: CGPoint) -> Bool {
+        guard mcSurfacePresent, let geometry, let hovered,
+              let index = geometry.hitTest(point), index < currentActions.count
+        else { return false }
+        let action = currentActions[index]
+        let target = hovered
+        // Instant visual dismiss without dropping AX targets yet.
+        overlayWindow?.alphaValue = 0
+        overlayWindow?.orderOut(nil)
+        // Perform while window IDs are still valid, then fully tear down overlay state.
+        perform(action, on: target)
+        hideOverlay()
+        if action == .zoom {
+            // Zoom exits Mission Control — suppress any re-show through the exit
+            // animation so icons never linger on the desktop / expanding window.
+            suppressOverlayReshow = true
+            scheduleSuppressReshowClear()
+            self.hovered = nil
+            endSession() // stop mouse/fetch taps; MC is leaving
+        } else if action == .close || action == .minimize {
+            // Close/minimize → MC stays open and re-tiles; track frames hard.
+            beginPostRetileBoost()
+        }
+        return true
+    }
+
+    private func handleClick(at point: CGPoint) -> Bool {
+        // A traffic-light button hit consumes the click (swallow so MC never sees it).
+        if performButtonHit(at: point) { return false }
+        // Any other left click is the user dismissing Mission Control (clicking a
+        // thumbnail to switch windows, or empty space). Hide the lights instantly
+        // AND suppress re-show through MC's exit animation so they don't flash back
+        // on at a garbage position before `endSession`. Then pass through so Mission
+        // Control still handles it (switch / exit).
+        suppressOverlayReshow = true
+        scheduleSuppressReshowClear()
+        hideOverlay()
+        return true // pass through — Mission Control handles the click
+    }
+
+    /// A middle / other-button click, routed through the SAME button hit-test as a
+    /// left click (so a middle-click on a control acts on it): it acts only as a
+    /// button hit. A miss passes through WITHOUT the left-click's dismiss side
+    /// effects — a middle-click on empty space must not tear Mission Control's
+    /// overlay down.
+    private func handleSecondaryClick(at point: CGPoint) -> Bool {
+        performButtonHit(at: point) ? false : true
+    }
+
+    /// Fallback clear for `suppressOverlayReshow`. A real MC close clears it sooner
+    /// via `endSession` (which also cancels this task), so in the common click-to-exit
+    /// case this timer never fires. It only matters when a pass-through click leaves
+    /// Mission Control *open* (e.g. clicking empty space), letting the lights recover
+    /// on the next hover instead of staying off for the whole session. Sized (2 s) to
+    /// comfortably outlast the exit animation + the ~600 ms close-poll so it can never
+    /// fire mid-exit and re-flash the overlay.
+    private func scheduleSuppressReshowClear() {
+        suppressReshowTask?.cancel()
+        suppressReshowTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(2000))
+            guard let self, !Task.isCancelled else { return }
+            self.suppressOverlayReshow = false
+            // A hover that landed DURING the suppression window updated `hovered`
+            // but never resolved/showed (repositionOverlay early-returns while
+            // suppressed), and a parked cursor never re-triggers it — the second
+            // stuck-dark variant. Re-resolve now so the lights recover in place
+            // instead of requiring the cursor to leave the window and come back.
+            // `awaitFreshHoverAfterClick` keeps the window the click actually
+            // landed on dark until a fresh hover (the "post-click flash" rule) —
+            // this re-show is only for a hover that CHANGED during suppression.
+            if self.sessionActive, self.layoutSettled, self.hovered != nil, self.geometry == nil,
+               !self.awaitFreshHoverAfterClick {
+                self.repositionOverlay()
+            }
+        }
+    }
+
+    /// Clear the post-click re-show suppression and cancel its safety timer. Called
+    /// at every session boundary so the flag can never leak across sessions.
+    private func clearReshowSuppression() {
+        suppressOverlayReshow = false
+        suppressReshowTask?.cancel()
+        suppressReshowTask = nil
+    }
+
+    /// Order the overlay out immediately on a click and drop the geometry/action
+    /// mapping so a follow-up click in the same spot can't re-trigger a now-hidden
+    /// button. Keeps `hovered` so a same-window tick doesn't re-show the lights.
+    private func hideOverlay() {
+        clearOverlayContent()
+        hoverState.hoveredIndex = nil
+        // Passive re-shows (background-resolve merge, suppression-clear timer)
+        // must not re-light the just-clicked window; only the next fresh hover
+        // may (`trackMouse` clears this on a windowID change).
+        awaitFreshHoverAfterClick = true
+        // End the post-settle re-anchor watch: a click means the overlay was up and the
+        // user acted, so the fast-enter no-show (#3) is already resolved for this
+        // session. Without this, a forced re-anchor tick would rebuild and re-show the
+        // lights on the just-acted window for a tick (a button hit keeps `hovered` and
+        // deliberately does not suppress) — the "post-click flash" this rule prevents.
+        sinkWatchTicks = 0
+        Log.missionControl.debug("overlay hidden on click")
+    }
+
+    /// ~650 ms of moderately accelerated window-list polling after close/minimize so overlays
+    /// track Mission Control's re-tile instead of sitting on stale frames.
+    private func beginPostRetileBoost() {
+        resetSettleState()
+        refreshWindows()
+        // Keep capability results for windows that are still visible. Re-warming
+        // every remaining tile after each close creates unnecessary AX traffic and
+        // can make a 10–12 tile Mission Control session feel like it pauses after
+        // every action. Refresh first so the just-closed window is actually removed
+        // from the retained caches.
+        let liveIDs = Set(windows.map(\.windowID))
+        capabilityCache = capabilityCache.filter { liveIDs.contains($0.key) }
+        backgroundResolveRounds = backgroundResolveRounds.filter { liveIDs.contains($0.key) }
+        backgroundResolveInFlight = backgroundResolveInFlight.intersection(liveIDs)
+        postRetileBoostUntil = ContinuousClock.now + .milliseconds(650)
+        postRetileBoostTask?.cancel()
+        postRetileBoostTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(650))
+            guard let self, !Task.isCancelled else { return }
+            self.postRetileBoostUntil = nil
+            self.postRetileBoostTask = nil
+        }
+    }
+
+    private var isInPostRetileBoost: Bool {
+        guard let until = postRetileBoostUntil else { return false }
+        return ContinuousClock.now < until
+    }
+
+    private func handleKey(_ keyCode: CGKeyCode, _ flags: CGEventFlags) -> Bool {
+        // Intercept in-MC shortcuts ONLY while Mission Control is actually on screen.
+        // The tap lingers through the ~600 ms close-miss debounce after MC exits, so
+        // without this a ⌘W/⌥⌘W in that tail would be swallowed and acted on the stale
+        // hovered thumbnail. Pass the key through once the surface is gone.
+        guard mcSurfacePresent else { return true }
+        for shortcut in MissionControlShortcut.allCases {
+            guard let chord = chordProvider(shortcut), chord.matches(keyCode: keyCode, flags: flags) else { continue }
+            apply(shortcut)
+            return false // swallow — the shortcut consumed the key
+        }
+        return true
+    }
+
+    private func apply(_ shortcut: MissionControlShortcut) {
+        let action = shortcut.windowAction
+        if shortcut.isBatch {
+            // Every batch action is relative to the hovered window; with nothing
+            // under the cursor there is no target, so beep (the key is swallowed)
+            // rather than silently acting on every window — the standard macOS
+            // signal for a hot key that had no effect.
+            guard let hovered else { NSSound.beep(); return }
+            switch shortcut {
+            case .hideAllExceptHovered:
+                // Hide every OTHER regular app system-wide — not just the apps that
+                // happen to have a captured Mission Control thumbnail — excluding the
+                // hovered app and CloseUp itself. Like the system Hide-Others (⌥⌘H),
+                // iterate `NSWorkspace.runningApplications`, not the window capture.
+                for app in NSWorkspace.shared.runningApplications
+                where app.activationPolicy == .regular
+                    && app.processIdentifier != hovered.ownerPID
+                    && app.processIdentifier != ownPID {
+                    app.hide()
+                }
+            case .closeAll, .minimizeAll:
+                // Close / minimize the HOVERED app's full window list (its AXWindows,
+                // reaching minimized / other-Space windows too), and ONLY the hovered
+                // app — never every app's windows (that cross-app close-everything was a
+                // data-loss footgun, fixed). ⌥⌘W close-all and ⌥⌘M minimize-all are a
+                // symmetric pair, mirroring "Hide All but This".
+                performer.performOnAllWindows(action, ofApp: hovered.ownerPID)
+            default:
+                break
+            }
+        } else if let hovered {
+            hideOverlay()
+            perform(action, on: hovered)
+            if action == .zoom {
+                suppressOverlayReshow = true
+                scheduleSuppressReshowClear()
+                self.hovered = nil
+                endSession()
+            } else if action == .close || action == .minimize {
+                beginPostRetileBoost()
+            }
+        } else {
+            // A gated single-window shortcut fired with no window under the cursor;
+            // the key was swallowed, so signal the no-op with the standard beep.
+            NSSound.beep()
+        }
+    }
+
+    private func perform(_ action: WindowAction, on window: WindowInfo) {
+        if action == .zoom {
+            // The Dock notification is a Mission Control toggle, not a passive
+            // "wake". Pressing the AX zoom button immediately after it races the
+            // Mission Control transition and can leave the desktop layout stuck or
+            // partially tiled. Close MC first, let that transition settle for one
+            // short run-loop interval, then perform the real zoom action.
+            // wakeMissionControl can emit a second expose notification before the
+            // lifecycle poll notices that Mission Control is gone. Do not allow that
+            // stale notification to rebuild the traffic-light overlay on the desktop.
+            suppressSessionRestartUntil = ContinuousClock.now + .milliseconds(1500)
+            clearOverlayContent()
+            performer.wakeMissionControl()
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(120))
+                guard let self else { return }
+                self.performer.perform(.zoom, on: window)
+            }
+            return
+        }
+        performer.perform(action, on: window)
+    }
+
+    // MARK: - Overlay window
+
+    /// Build a NOT-yet-shown overlay window already at its final `frame` (AppKit
+    /// coordinates). Callers order it front and never move it afterwards — see
+    /// `presentOverlay` for why a shown overlay window is immutable.
+    private func makeOverlayWindow(at frame: NSRect) -> NSWindow {
+        let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.level = .screenSaver // above the Dock-drawn Mission Control surface
+        window.backgroundColor = .clear
+        window.isOpaque = false
+        window.hasShadow = false
+        window.ignoresMouseEvents = true // fully passive — the event tap is the only click handler
+        window.isReleasedWhenClosed = false
+        // No AppKit order-in/out animation either: the lights must appear and vanish
+        // in one frame, like native Mission Control's controls (#6 also shows the
+        // retired cluster fading out at its old position).
+        window.animationBehavior = .none
+        // NB: do NOT add `.transient` — the system hides transient windows during
+        // Mission Control gestures, so a 3-finger swipe (even one that doesn't
+        // change Space, e.g. swiping past the last desktop) would hide the overlay
+        // for the rest of the MC session and the lights would vanish on every
+        // window until MC was reopened. `.canJoinAllSpaces` makes it follow across
+        // desktops; `.ignoresCycle` keeps it out of window cycling. (OpenMissionControl
+        // sets no collection behavior at all and is immune to this.)
+        var behavior: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        // macOS 27 "Golden Gate": Mission Control is composited by WindowManager,
+        // which hides EVERY non-participating window while MC is open regardless
+        // of window level — A/B-probed on 26A5368g: both a `.screenSaver`-level
+        // and a shielding-level window vanish during MC unless they carry
+        // `.stationary` ("unaffected by Exposé"), with which they composite above
+        // the exposé surface. Without this the whole pipeline runs (session,
+        // settle, hover, `overlay show` with a lying `visible=y`) yet nothing is
+        // on screen. Gated to 27+ only because the ≤26 Dock-drawn MC composites
+        // the overlay correctly with the base set (verified through 26) and that
+        // shipped-working recipe should not change on a version we can no longer
+        // regression-test locally.
+        if #available(macOS 27.0, *) { behavior.insert(.stationary) }
+        window.collectionBehavior = behavior
+        return window
+    }
+
+    /// Take the overlay off screen and discard the window. A retired window is never
+    /// reused — the next show builds a fresh one at its own final frame
+    /// (`presentOverlay`) — so hide == retire. Also the re-tile recovery: a window
+    /// ordered-in before a Mission Control re-tile stays sunk behind the rebuilt
+    /// exposé surface (while reporting a false `visible=y`); only a window ordered-in
+    /// *after* the re-tile composites above it, and every show is exactly that.
+    private func retireOverlayWindow() {
+        guard let window = overlayWindow else { return }
+        overlayWindow = nil
+        // Zero alpha + orderOut first so the lights disappear in this frame,
+        // even if AppKit defers the actual close/dealloc slightly.
+        window.alphaValue = 0
+        window.orderOut(nil)
+        window.contentView = nil
+        window.close()
+    }
+
+    // MARK: - Screen geometry
+
+    /// Whether the window's owning app should get overlay controls: a normal
+    /// foreground app (`.regular`) or a menu-bar/agent app (`.accessory`,
+    /// LSUIElement) — both of which can show real, closable windows as Mission
+    /// Control thumbnails. Excludes `.prohibited` system processes (WindowServer,
+    /// wallpaper) and pids with no running app, which draw chrome-less surfaces
+    /// with nothing to act on.
+    private static func isOverlayableApp(_ pid: pid_t) -> Bool {
+        switch NSRunningApplication(processIdentifier: pid)?.activationPolicy {
+        case .regular, .accessory: return true
+        default: return false
+        }
+    }
+
+    /// Height of the screen at the AppKit coordinate origin (the menu-bar
+    /// screen) — the pivot for the CoreGraphics↔AppKit Y flip.
+    private static func menuBarScreenHeight() -> CGFloat {
+        if let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero }) {
+            return primary.frame.height
+        }
+        return NSScreen.main?.frame.height ?? 0
+    }
+}
