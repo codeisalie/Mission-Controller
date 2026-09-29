@@ -7,7 +7,6 @@
 Put the controls back where they belong. **Mission Controller** is a lightweight macOS utility that overlays instant, responsive window management controls—featuring **Force Quit/Close**, Minimize, and Maximize full screen window directly onto your native Mission Control previews.
 
 <p align="center">
-<img width="515" height="314" alt="Screenshot 2026-09-29 at 4 32 52 AM" src="https://github.com/user-attachments/assets/b2a05972-9bed-427c-b981-5eeab20f8f25" />
 
 </p>
 
